@@ -34,6 +34,9 @@ yarn-error.log*
 # Its contents rather than the directory, so a file in it can be let back in.
 **/.storysync/*
 
+# spike run output: transcripts can contain account details
+spikes/*/results/
+
 # example project dependencies
 examples/*/node_modules/
 
