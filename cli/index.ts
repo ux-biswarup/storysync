@@ -3,21 +3,21 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import ora from "ora";
-import { StorybookClient, selectComponents, findComponent } from "./storybook.js";
+import { StorybookClient, MissingDocsToolsError, selectComponents, findComponent } from "./storybook.js";
 import { FigmaClient } from "./figma.js";
 import { mapComponent, DEFAULT_MAX_COMBINATIONS } from "./mapper.js";
-import { detectTokenSource, extractTokens, compareTokens, hasDrift, readTokenBaseline, baselineCommand, parseTokenSource } from "./tokens.js";
+import { detectTokenSource, extractTokens, compareTokens, hasDrift, readTokenBaseline, baselineCommand, parseTokenSource, summarizeUncategorized } from "./tokens.js";
 import { diffTokens, diffComponents, selectDiffComponents, narrowFigmaComponents, computeDiffSummary, hasDifferences } from "./diff.js";
 import { runSnap } from "./snap.js";
 import { resolveAndLaunch } from "./snap-browser.js";
 import { verify, loadJsonFile, formatFidelity, parseDuration, formatAge, readSnapAge } from "./verify.js";
 import type { ReadbackFile, ReadbackIssue, SnapAgeInfo } from "./verify.js";
 import type { SnapResult } from "./snap.js";
-import { runInit } from "./init.js";
+import { runInit, diagnoseMissingDocsTools } from "./init.js";
 import { runSetup, type Client } from "./setup.js";
 import { VERSION } from "./version.js";
 import type { TokenBaseline, TokenExtractionResult, TokenSourceType } from "./tokens.js";
-import type { FigmaComponentDefinition, CapInfo } from "./mapper.js";
+import type { FigmaComponentDefinition, CapInfo, SkippedProp } from "./mapper.js";
 import type { FigmaVariable, FigmaComponentInfo } from "./figma.js";
 import type { TokenDiffEntry, ComponentDiffEntry } from "./diff.js";
 import type { ComponentEntry } from "./storybook.js";
@@ -73,6 +73,22 @@ async function connectMcp<T extends { connect(): Promise<void> }>(client: T, ser
   }
 }
 
+/** Where `storybook dev` listens unless told otherwise. */
+const DEFAULT_STORYBOOK_URL = "http://localhost:6006";
+
+/**
+ * The Storybook URL a command reads from: --storybook, or Storybook's default
+ * port, said so the user can tell which one was read. Written back to `opts`
+ * so later uses in the command see the same URL.
+ */
+function storybookUrl(opts: { storybook?: string }, json: boolean): string {
+  if (!opts.storybook) {
+    opts.storybook = DEFAULT_STORYBOOK_URL;
+    if (!json) console.log(chalk.dim(`Using Storybook at ${DEFAULT_STORYBOOK_URL} (pass --storybook to use another)`));
+  }
+  return opts.storybook;
+}
+
 function connectStorybook(url: string, json: boolean, timeoutMs: number): Promise<StorybookClient> {
   return connectMcp(new StorybookClient(url), "Storybook MCP", url, json, timeoutMs);
 }
@@ -97,10 +113,18 @@ function parseConnectTimeout(value: unknown): number {
 const program = new Command();
 program.name("storysync").description("Sync design tokens and Storybook components to Figma").version(VERSION);
 
-/** Prints an error that ends a command: as JSON on stdout under --json, so the output still parses. */
+/**
+ * Prints an error that ends a command: as JSON on stdout under --json, so the
+ * output still parses. Missing docs tools come with what's missing in this
+ * project's Storybook config.
+ */
 function reportError(err: unknown, json: boolean): void {
-  if (json) console.log(JSON.stringify({ error: String(err) }));
-  else console.error(chalk.red(`\n${err instanceof Error ? err.message : String(err)}`));
+  const advice = err instanceof MissingDocsToolsError ? diagnoseMissingDocsTools(process.cwd()) : [];
+  if (json) console.log(JSON.stringify({ error: String(err), ...(advice.length ? { advice } : {}) }));
+  else {
+    console.error(chalk.red(`\n${err instanceof Error ? err.message : String(err)}`));
+    for (const line of advice) console.error(chalk.yellow(`  ${line}`));
+  }
 }
 
 /**
@@ -126,6 +150,24 @@ function readbackIssueReason(issue: ReadbackIssue, snapAge: SnapAgeInfo): string
   }
 }
 
+/**
+ * The tokens command's warnings. Variables no category matched are grouped by
+ * name prefix with what to do about them, rather than listed one per line;
+ * --all lists them too.
+ */
+function printTokenWarnings(warnings: string[], all: boolean): void {
+  const { groups, uncategorized, other } = summarizeUncategorized(warnings);
+  if (!warnings.length) return;
+  console.log(chalk.dim(`\nWarnings:`));
+  for (const w of other) console.log(chalk.dim(`  ${w}`));
+  if (!uncategorized) return;
+  console.log(chalk.yellow(`  ${uncategorized} variable${uncategorized === 1 ? "" : "s"} matched no token category, so ${uncategorized === 1 ? "it isn't" : "they aren't"} in the collections above:`));
+  for (const g of groups.slice(0, all ? groups.length : 8)) console.log(chalk.dim(`    ${g.prefix.padEnd(40)} ${g.count}`));
+  if (!all && groups.length > 8) console.log(chalk.dim(`    ... and ${groups.length - 8} more prefixes (use --all to list every variable)`));
+  if (all) for (const w of warnings.filter((x) => x.startsWith("Uncategorized: "))) console.log(chalk.dim(`    ${w.slice("Uncategorized: ".length)}`));
+  console.log(chalk.dim("  A variable's category comes from its name: --color-*, --spacing-*, --radius-*, --font-* or --text-*, and --shadow-*."));
+}
+
 /** Parses --max-combinations, exiting with a clear message on anything but a positive integer. */
 function parseMaxCombinations(value: unknown): number {
   const n = Number(value);
@@ -139,7 +181,7 @@ function parseMaxCombinations(value: unknown): number {
 program
   .command("map")
   .description("Map all Storybook components to Figma variant definitions")
-  .requiredOption("--storybook <url>", "Storybook URL")
+  .option("--storybook <url>", `Storybook URL (default: ${DEFAULT_STORYBOOK_URL})`)
   .option("--connect-timeout <ms>", "How long to wait for Storybook MCP to answer before failing, in milliseconds", String(DEFAULT_CONNECT_TIMEOUT_MS))
   .option("--components <names>", "Comma-separated component names or IDs; a name that matches nothing is an error")
   .option("--json", "Output JSON instead of formatted text")
@@ -148,7 +190,7 @@ program
   .action(async (opts) => {
     const json = !!opts.json;
     const maxCombinations = parseMaxCombinations(opts.maxCombinations);
-    const storybook = await connectStorybook(opts.storybook, json, parseConnectTimeout(opts.connectTimeout));
+    const storybook = await connectStorybook(storybookUrl(opts, json), json, parseConnectTimeout(opts.connectTimeout));
     try {
       const spinner = json ? null : ora("Reading components...").start();
       let entries: ComponentEntry[];
@@ -173,14 +215,14 @@ program
         return;
       }
 
-      const results: { name: string; title?: string; category?: string; variantProperties: { name: string; type: string; values: string[]; defaultValue: string }[]; combinations: number; capped: boolean; cap?: CapInfo; error: string | null }[] = [];
+      const results: { name: string; title?: string; category?: string; variantProperties: { name: string; type: string; values: string[]; defaultValue: string }[]; combinations: number; capped: boolean; cap?: CapInfo; skippedProps: SkippedProp[]; error: string | null }[] = [];
       let total = 0, capped = 0, failed = 0;
 
       for (const entry of entries) {
         try {
           const component = await storybook.getComponent(entry.id, entry.name, entry.title, entry.category);
           const def = mapComponent(component, maxCombinations);
-          results.push({ name: entry.name, title: entry.title, category: entry.category, variantProperties: def.variantProperties, combinations: def.variantCombinations.length, capped: def.wasCapped, ...(def.cap ? { cap: def.cap } : {}), error: null });
+          results.push({ name: entry.name, title: entry.title, category: entry.category, variantProperties: def.variantProperties, combinations: def.variantCombinations.length, capped: def.wasCapped, ...(def.cap ? { cap: def.cap } : {}), skippedProps: def.skippedProps ?? [], error: null });
           if (!json) {
             const info = def.variantProperties.map((p) => `${p.name}(${p.values.length})`).join(", ");
             const tag = def.cap ? chalk.yellow(` [CAPPED ${def.cap.generated}/${def.cap.totalPossible}]`) : "";
@@ -191,12 +233,17 @@ program
               const suffix = example ? `, e.g. ${JSON.stringify(example)}` : "";
               console.log(chalk.dim(`      ${def.cap.droppedCount} combinations not emitted${suffix}`));
             }
+            const free = def.skippedProps?.filter((p) => p.kind === "free-value") ?? [];
+            const unresolved = def.skippedProps?.filter((p) => p.kind === "unresolved-type") ?? [];
+            const list = (ps: SkippedProp[]) => ps.map((p) => `${p.name} (${p.type})`).join(", ");
+            if (unresolved.length) console.log(chalk.yellow(`      not variants, values not visible: ${list(unresolved)}. List their values as options in argTypes`));
+            if (free.length) console.log(chalk.dim(`      not variants, free values: ${list(free)}`));
           }
           total += def.variantCombinations.length;
           if (def.wasCapped) capped++;
         } catch (err) {
           failed++;
-          results.push({ name: entry.name, title: entry.title, category: entry.category, variantProperties: [], combinations: 0, capped: false, error: String(err) });
+          results.push({ name: entry.name, title: entry.title, category: entry.category, variantProperties: [], combinations: 0, capped: false, skippedProps: [], error: String(err) });
           if (!json) console.log(`  ${chalk.red("✗")} ${chalk.bold(entry.title ?? entry.name)} ${chalk.red(String(err))}`);
         }
       }
@@ -222,7 +269,7 @@ program
 program
   .command("snap")
   .description("Measure each component variant's rendered styles from a running Storybook")
-  .requiredOption("--storybook <url>", "Storybook URL")
+  .option("--storybook <url>", `Storybook URL (default: ${DEFAULT_STORYBOOK_URL})`)
   .option("--connect-timeout <ms>", "How long to wait for Storybook MCP to answer before failing, in milliseconds", String(DEFAULT_CONNECT_TIMEOUT_MS))
   .option("--components <names>", "Comma-separated component names or IDs; a name that matches nothing is an error")
   .option("--out <dir>", "Output directory", ".storysync/snaps")
@@ -250,7 +297,7 @@ program
     const maxCombinations = parseMaxCombinations(opts.maxCombinations);
     const connectTimeoutMs = parseConnectTimeout(opts.connectTimeout);
 
-    const storybook = await connectStorybook(opts.storybook, json, connectTimeoutMs);
+    const storybook = await connectStorybook(storybookUrl(opts, json), json, connectTimeoutMs);
     try {
       const result = await runSnap(
         {
@@ -507,10 +554,10 @@ program
 program
   .command("list")
   .description("List components in Storybook")
-  .requiredOption("--storybook <url>", "Storybook URL")
+  .option("--storybook <url>", `Storybook URL (default: ${DEFAULT_STORYBOOK_URL})`)
   .option("--connect-timeout <ms>", "How long to wait for Storybook MCP to answer before failing, in milliseconds", String(DEFAULT_CONNECT_TIMEOUT_MS))
   .action(async (opts) => {
-    const storybook = await connectStorybook(opts.storybook, false, parseConnectTimeout(opts.connectTimeout));
+    const storybook = await connectStorybook(storybookUrl(opts, false), false, parseConnectTimeout(opts.connectTimeout));
     try {
       const entries = await storybook.listComponents();
       console.log(`\n${entries.length} components:\n`);
@@ -618,11 +665,15 @@ program
     // still an error, and against one that exists, every token it holds was
     // removed.
     let detected = true;
-    if (!json) {
+    if (!json && source) {
+      // Named by --source: nothing is detected, so nothing is said to be.
+      console.log(`${chalk.green("✔")} Source: ${source} ${chalk.dim("(from --source)")}`);
+    } else if (!json) {
       const spinner = ora("Detecting token source...").start();
-      const source = detectTokenSource(projectPath);
-      if (source) {
-        spinner.succeed(`Detected: ${source.type} (${source.path})`);
+      const found = detectTokenSource(projectPath);
+      if (found) {
+        spinner.succeed(`Detected: ${found.type} (${found.path})`);
+        console.log(chalk.dim(`  ${found.reason}. Pass --source to choose another.`));
       } else {
         spinner.fail("No token source found");
         detected = false;
@@ -640,7 +691,7 @@ program
       if (opts.strict) process.exitCode = 1;
       if (!json && detected) {
         console.log(chalk.yellow("\nNo tokens found."));
-        for (const w of result.warnings) console.log(chalk.dim(`  ${w}`));
+        printTokenWarnings(result.warnings, !!opts.all);
       }
     }
 
@@ -684,10 +735,8 @@ program
         }
       }
       console.log(`\n${totalTokens} tokens in ${result.collections.length} collections`);
-      if (result.warnings.length) {
-        console.log(chalk.dim(`\nWarnings:`));
-        for (const w of result.warnings) console.log(chalk.dim(`  ${w}`));
-      }
+      if (result.sourcePath && source) console.log(chalk.dim(`  from ${result.sourcePath}`));
+      printTokenWarnings(result.warnings, !!opts.all);
       console.log(chalk.dim("To create Figma variables, use the Claude Code skill or Cursor rules file."));
     }
   });
@@ -695,11 +744,11 @@ program
 program
   .command("inspect")
   .description("Show how a component's props map to Figma variants")
-  .requiredOption("--storybook <url>", "Storybook URL")
+  .option("--storybook <url>", `Storybook URL (default: ${DEFAULT_STORYBOOK_URL})`)
   .requiredOption("--component <name>", "Component name or ID; a name that matches nothing is an error")
   .option("--connect-timeout <ms>", "How long to wait for Storybook MCP to answer before failing, in milliseconds", String(DEFAULT_CONNECT_TIMEOUT_MS))
   .action(async (opts) => {
-    const storybook = await connectStorybook(opts.storybook, false, parseConnectTimeout(opts.connectTimeout));
+    const storybook = await connectStorybook(storybookUrl(opts, false), false, parseConnectTimeout(opts.connectTimeout));
     try {
       // A name that matches nothing fails here, naming what exists, before
       // asking Storybook for the documentation of a component it never listed.
@@ -713,7 +762,8 @@ program
         if (v) {
           console.log(`  ${chalk.green("✓")} ${prop.name} (${prop.type.name}) -> ${v.type} [${v.values.join(", ")}]`);
         } else {
-          console.log(`  ${chalk.dim("✗")} ${prop.name} (${prop.type.name}) -> skipped`);
+          const reason = def.skippedProps?.find((s) => s.name === prop.name)?.reason ?? "never a variant";
+          console.log(`  ${chalk.dim("✗")} ${prop.name} (${prop.type.name}) -> skipped: ${chalk.dim(reason)}`);
         }
       }
       console.log(`\n${def.variantProperties.length} variant properties, ${def.variantCombinations.length} combinations${def.wasCapped ? " (capped)" : ""}\n`);

@@ -362,6 +362,48 @@ test("mapComponent: a component with no mappable props yields one empty combinat
   assert.equal(def.wasCapped, false);
 });
 
+test("mapComponent: reports props that could have been variants and why they aren't", () => {
+  const def = mapComponent(component([
+    prop({ name: "severity", type: { name: "string" } }),
+    prop({ name: "count", type: { name: "number" } }),
+    prop({ name: "item", type: { name: "union", raw: "Item | null" } }),
+    prop({ name: "size", type: { name: "union", raw: `"sm" | "lg"` } }),
+  ]));
+  assert.deepEqual(def.skippedProps?.map((p) => [p.name, p.type]), [["severity", "string"], ["count", "number"], ["item", "union"]]);
+  assert.deepEqual(def.skippedProps?.map((p) => p.kind), ["free-value", "free-value", "unresolved-type"]);
+  assert.match(def.skippedProps![0].reason, /^free text; give it options in its argTypes/);
+  assert.match(def.skippedProps![1].reason, /^free number;/);
+  assert.match(def.skippedProps![2].reason, /^its type union doesn't show its values/);
+});
+
+test("mapComponent: a named union type, as Vue's docs give it, is reported as values not visible", () => {
+  // Field test: Button's severity is `ButtonSeverity`, a union the docs name but don't spell out.
+  const def = mapComponent(component([prop({ name: "severity", type: { name: "ButtonSeverity" } })]));
+  assert.deepEqual(def.skippedProps?.map((p) => [p.name, p.kind]), [["severity", "unresolved-type"]]);
+  assert.match(def.skippedProps![0].reason, /ButtonSeverity doesn't show its values/);
+});
+
+test("mapComponent: Vue slots and emitted events listed with empty types aren't reported", () => {
+  const def = mapComponent(component([prop({ name: "default", type: { name: "{}" } }), prop({ name: "remove", type: { name: "[]" } })]));
+  assert.deepEqual(def.skippedProps, []);
+});
+
+test("mapComponent: never reports props that are never variants", () => {
+  const def = mapComponent(component([
+    prop({ name: "children" }),
+    prop({ name: "onClick", type: { name: "func" } }),
+    prop({ name: "aria-label" }),
+    prop({ name: "icon", type: { name: "ReactNode" } }),
+  ]));
+  assert.deepEqual(def.skippedProps, []);
+});
+
+test("mapComponent: a string prop with options is a variant, not skipped", () => {
+  const def = mapComponent(component([prop({ name: "severity", type: { name: "string" }, control: { options: ["info", "danger"] } })]));
+  assert.deepEqual(def.variantProperties.map((p) => p.name), ["severity"]);
+  assert.deepEqual(def.skippedProps, []);
+});
+
 test("mapComponent: surfaces cap info when the product is truncated", () => {
   const def = mapComponent(component([
     prop({ name: "a", control: { options: Array.from({ length: 20 }, (_, i) => `a${i}`) } }),

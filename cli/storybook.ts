@@ -208,6 +208,18 @@ const GENERATED_PROPS = /^## Props[ \t]*\r?\n\s*```[^\n]*\n[ \t]*export type Pro
 // A subcomponent's props: the "#### Props" heading and the code block after it.
 const SUBCOMPONENT_PROPS = /^#### Props[ \t]*\r?\n\s*```[\s\S]*?```/gm;
 
+/**
+ * Storybook MCP answered but offers no docs tools. The CLI adds why, from the
+ * project's own config, since the cause is usually a feature flag rather than
+ * the Storybook version.
+ */
+export class MissingDocsToolsError extends Error {
+  constructor() {
+    super("Storybook MCP is running, but it has no docs tools (docs-list and docs-show, or list-all-documentation and get-documentation before addon-mcp 10.6), so storysync can't read components.");
+    this.name = "MissingDocsToolsError";
+  }
+}
+
 export class StorybookClient {
   private client: Client | null = null;
   private docsTools: DocsTools | null = null;
@@ -261,13 +273,7 @@ export class StorybookClient {
   private async getDocsTools(): Promise<DocsTools> {
     if (this.docsTools) return this.docsTools;
     const tools = resolveDocsTools(await this.listAvailableTools());
-    if (!tools) {
-      throw new Error(
-        "Storybook MCP is missing the docs tools (docs-list and docs-show, or list-all-documentation and get-documentation before addon-mcp 10.6).\n" +
-          "  The docs tools require Storybook 10.1+ — they are not available in Storybook 9.x.\n" +
-          "  Run `storysync init` to check your setup, or upgrade with: npx storybook@latest upgrade",
-      );
-    }
+    if (!tools) throw new MissingDocsToolsError();
     this.docsTools = tools;
     return tools;
   }

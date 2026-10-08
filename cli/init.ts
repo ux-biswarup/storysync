@@ -109,6 +109,56 @@ function getInstalledVersion(projectPath: string, name: string): string | null {
   }
 }
 
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * The version of `name` the project's lockfile pins, or null when there is no
+ * lockfile, it doesn't list the package, or it is bun's binary lockfile. Finds
+ * the lockfile as detectPackageManager does. Where a lockfile holds several
+ * versions of the package, the newest.
+ *
+ * This is the version an install ends up with: node_modules can lag behind its
+ * lockfile, and running the package manager to add addon-mcp also brings
+ * node_modules back in line with it.
+ */
+export function getLockedVersion(projectPath: string, name: string): { version: string; lockfile: string } | null {
+  for (let dir = resolve(projectPath); ; dir = dirname(dir)) {
+    for (const file of ["pnpm-lock.yaml", "yarn.lock", "package-lock.json", "npm-shrinkwrap.json"]) {
+      const path = join(dir, file);
+      if (!existsSync(path)) continue;
+      const versions = lockedVersions(readFileSync(path, "utf8"), file, name);
+      const newest = versions
+        .map((v) => ({ v, parsed: parseStorybookVersion(v) }))
+        .filter((x): x is { v: string; parsed: ParsedVersion } => x.parsed != null)
+        .sort((a, b) => compareVersions(b.parsed, a.parsed))[0];
+      return newest ? { version: newest.v, lockfile: file } : null;
+    }
+    if (existsSync(join(dir, "bun.lock")) || existsSync(join(dir, "bun.lockb"))) return null;
+    if (existsSync(join(dir, ".git")) || dirname(dir) === dir) return null;
+  }
+}
+
+function lockedVersions(content: string, file: string, name: string): string[] {
+  const n = escapeRegExp(name);
+  if (file.endsWith(".json")) {
+    try {
+      const lock = JSON.parse(content) as { packages?: Record<string, { version?: string }>; dependencies?: Record<string, { version?: string }> };
+      const v = lock.packages?.[`node_modules/${name}`]?.version ?? lock.dependencies?.[name]?.version;
+      return v ? [v] : [];
+    } catch {
+      return [];
+    }
+  }
+  if (file === "pnpm-lock.yaml") {
+    // `  storybook@10.6.0:` and `  '@storybook/addon-mcp@10.6.1(…)':` (v9), or `  /storybook/10.6.0:` (v6).
+    const re = new RegExp(`^ {2}['"]?(?:${n}@|/${n}/)(\\d[^:'"(\\s]*)`, "gm");
+    return [...content.matchAll(re)].map((m) => m[1]);
+  }
+  // yarn.lock: a block whose header names `name@…`, then `version "x"` (v1) or `version: x` (berry).
+  const re = new RegExp(`^"?(?:[^\\n]*[ ,"])?${n}@[^\\n]*:\\n(?:[ \\t]+[^\\n]*\\n)*?[ \\t]+version:? "?([^"\\n]+)"?`, "gm");
+  return [...content.matchAll(re)].map((m) => m[1].trim());
+}
+
 /** The version of Storybook installed for the project; see getInstalledVersion. */
 export function getInstalledStorybookVersion(projectPath: string): string | null {
   return getInstalledVersion(projectPath, "storybook");
@@ -248,11 +298,123 @@ export function hasAddonMcpInConfig(content: string): boolean {
  * line it lands on and breaks the file, or never loads.
  */
 export function addAddonToConfig(content: string): { content: string; ok: boolean } {
-  const m = maskComments(content).match(/(addons\s*:\s*\[)/);
+  // The key may be quoted, as Storybook's own installer writes it: `"addons": [`.
+  const m = /(?:^|[\s,{(])(["']?)addons\1\s*:\s*\[/m.exec(maskComments(content));
   if (!m) return { content, ok: false };
-  const insertAt = (m.index ?? 0) + m[0].length;
+  const insertAt = m.index + m[0].length;
   const entry = `\n    { name: "@storybook/addon-mcp", options: { toolsets: { docs: true } } },`;
   return { content: content.slice(0, insertAt) + entry + content.slice(insertAt), ok: true };
+}
+
+/**
+ * Turns `flag` on in the config's `features`: inside an existing `features: {`,
+ * or as a new `features` entry just before `framework`. Keys are quoted when
+ * the config quotes its own. Not ok when neither is found.
+ */
+export function addFeatureToConfig(content: string, flag: string): { content: string; ok: boolean } {
+  const masked = maskComments(content);
+  const existing = /(?:^|[\s,{(])(["']?)features\1\s*:\s*\{/m.exec(masked);
+  if (existing) {
+    const q = existing[1];
+    const at = existing.index + existing[0].length;
+    return { content: `${content.slice(0, at)} ${q}${flag}${q}: true,${content.slice(at)}`, ok: true };
+  }
+  const framework = /(^|[\s,{(])(["']?)framework\2\s*:/m.exec(masked);
+  if (!framework) return { content, ok: false };
+  const q = framework[2];
+  const at = framework.index + framework[1].length;
+  const indent = /[^\S\n]*$/.exec(content.slice(0, at))?.[0] ?? "";
+  const entry = `${q}features${q}: { ${q}${flag}${q}: true },\n${indent}`;
+  return { content: content.slice(0, at) + entry + content.slice(at), ok: true };
+}
+
+/** The ports `storybook dev` takes: 6006, or the next free one when it's taken. */
+const STORYBOOK_PORTS = [6006, 6007, 6008, 6009, 6010];
+
+/**
+ * Storybook dev servers answering on this machine, by URL. On Windows an
+ * install while one runs can fail with EPERM, since it holds files in
+ * node_modules open. A server is one whose /index.json lists stories.
+ */
+export async function findRunningStorybooks(
+  fetchImpl: typeof fetch = fetch,
+  ports: number[] = STORYBOOK_PORTS,
+): Promise<string[]> {
+  const found = await Promise.all(ports.map(async (port) => {
+    const url = `http://localhost:${port}`;
+    try {
+      const res = await fetchImpl(`${url}/index.json`, { signal: AbortSignal.timeout(800) });
+      if (!res.ok) return null;
+      const body = (await res.json()) as { entries?: unknown };
+      return body && typeof body === "object" && body.entries ? url : null;
+    } catch {
+      return null;
+    }
+  }));
+  return found.filter((u): u is string => u != null);
+}
+
+/** Feature flags `features` sets to true in a Storybook main config, outside comments. */
+function enabledFeatures(configContent: string): Set<string> {
+  const masked = maskComments(configContent);
+  const on = new Set<string>();
+  for (const m of masked.matchAll(/(["']?)(\w+)\1\s*:\s*true\b/g)) on.add(m[2]);
+  return on;
+}
+
+/** The framework package a Storybook main config names, e.g. `@storybook/vue3-vite`. */
+export function configFramework(configContent: string): string | null {
+  const m = /(["']?)framework\1\s*:\s*(?:\{[^}]*?(["']?)name\2\s*:\s*)?["'](@storybook\/[\w-]+)["']/.exec(maskComments(configContent));
+  return m?.[3] ?? null;
+}
+
+/**
+ * Why Storybook MCP has no docs tools, for the project in `projectPath`, as
+ * lines to show the user. The docs tools appear only when Storybook builds a
+ * component manifest: `features.componentsManifest` (which addon-mcp 10.6+
+ * turns on itself), and for Vue also `features.experimentalDocgenServer`,
+ * without which `@storybook/vue3-vite` returns no manifest. Says a version is
+ * too old only when it is.
+ */
+export function diagnoseMissingDocsTools(projectPath: string): string[] {
+  const config = findStorybookConfig(projectPath);
+  if (!config) {
+    return [
+      "Storysync couldn't check the setup: there's no .storybook/main.* here.",
+      "Run this command from the Storybook project's folder to see what's missing, or run `storysync init` there.",
+    ];
+  }
+  const version = getInstalledStorybookVersion(projectPath) ?? getStorybookVersion(projectPath);
+  if (!isStorybookVersionOk(version)) {
+    return [
+      `Storybook ${version ?? "(not found)"} is too old: the docs tools need Storybook 10.1 or later.`,
+      // npx ships with Node, and Storybook's upgrade finds the package manager itself.
+      "Upgrade with: npx storybook@latest upgrade",
+    ];
+  }
+  const features = enabledFeatures(config.content);
+  const framework = configFramework(config.content);
+  // addon-mcp 10.6 and later turns componentsManifest on itself; 0.7 doesn't.
+  const addon = parseStorybookVersion(getInstalledAddonMcpVersion(projectPath));
+  const addonEnablesManifest = addon != null && compareVersions(addon, FIRST_LOCKSTEP) >= 0;
+  const missing: string[] = [];
+  if (!addonEnablesManifest && !features.has("componentsManifest") && !features.has("experimentalComponentsManifest")) missing.push("componentsManifest: true");
+  if (framework === "@storybook/vue3-vite" && !features.has("experimentalDocgenServer")) missing.push("experimentalDocgenServer: true");
+  const file = relative(projectPath, config.path);
+  if (!missing.length) {
+    return [
+      `Storybook ${version} and ${file} look right for the docs tools.`,
+      "Restart Storybook if you changed its config since it started, and check addon-mcp is registered: `storysync init`.",
+    ];
+  }
+  const why = framework === "@storybook/vue3-vite" && missing.some((m) => m.startsWith("experimentalDocgenServer"))
+    ? " (@storybook/vue3-vite builds its component manifest only with experimentalDocgenServer)"
+    : "";
+  return [
+    `Storybook ${version} is new enough. The docs tools are off because ${file} doesn't turn on the component manifest${why}.`,
+    `Add to ${file}:  features: { ${missing.join(", ")} }`,
+    "Then restart Storybook.",
+  ];
 }
 
 // One reader of stdin for every prompt. A readline interface per prompt lost
@@ -372,23 +534,34 @@ async function checkAndFix(projectInput: string): Promise<void> {
 
   const pm = detectPackageManager(projectPath);
 
-  // The installed version when there is one: `^10.5.0` in package.json may
-  // well be 10.6 on disk, and the addon has to match what actually runs.
-  const sbVersion = getInstalledStorybookVersion(projectPath) ?? getStorybookVersion(projectPath);
+  // What will run after an install: the lockfile's version when it pins one,
+  // since installing addon-mcp also brings node_modules in line with the
+  // lockfile; else the installed version (`^10.5.0` in package.json may well
+  // be 10.6 on disk). Picked from node_modules alone, a stale install got an
+  // addon for the old Storybook while the install moved Storybook on.
+  const installedVersion = getInstalledStorybookVersion(projectPath);
+  const locked = getLockedVersion(projectPath, "storybook");
+  const sbVersion = locked?.version ?? installedVersion ?? getStorybookVersion(projectPath);
+  const lagging = locked && installedVersion && locked.version !== installedVersion ? { installed: installedVersion, ...locked } : null;
   const sbOk = isStorybookVersionOk(sbVersion);
   const hasAddon = hasAddonMcpInPackageJson(projectPath);
   const addonVersion = hasAddon ? getInstalledAddonMcpVersion(projectPath) : null;
   // Installed, but a release for a newer Storybook, so it doesn't load.
   const addonTooNew = addonMcpNeedsNewerStorybook(addonVersion, sbVersion);
   const inConfig = hasAddonMcpInConfig(config.content);
+  // @storybook/vue3-vite builds no component manifest, so addon-mcp offers
+  // no docs tools, unless docgen runs on the server.
+  const isVue = configFramework(config.content) === "@storybook/vue3-vite";
+  const needsDocgenServer = isVue && !enabledFeatures(config.content).has("experimentalDocgenServer");
 
   const addonMark = addonTooNew ? chalk.red("✖") : hasAddon ? chalk.green("✔") : chalk.yellow("✖");
   console.log(`${sbOk ? chalk.green("✔") : chalk.red("✖")} Storybook 10.1+ ${chalk.dim(sbVersion ? `(found ${sbVersion})` : "(not found)")}`);
   console.log(`${addonMark} @storybook/addon-mcp installed${addonVersion ? ` ${chalk.dim(`(found ${addonVersion})`)}` : ""}`);
   console.log(`${inConfig ? chalk.green("✔") : chalk.yellow("✖")} addon-mcp registered in addons array`);
+  if (isVue) console.log(`${needsDocgenServer ? chalk.yellow("✖") : chalk.green("✔")} experimentalDocgenServer on ${chalk.dim("(Vue needs it for the docs tools)")}`);
   console.log("");
 
-  if (sbOk && hasAddon && !addonTooNew && inConfig) {
+  if (sbOk && hasAddon && !addonTooNew && inConfig && !needsDocgenServer) {
     console.log(chalk.green("Everything looks good. Restart Storybook if it's running."));
     return;
   }
@@ -406,6 +579,19 @@ async function checkAndFix(projectInput: string): Promise<void> {
 
   if (!hasAddon || addonTooNew) {
     const spec = addonMcpInstallSpec(sbVersion);
+    if (lagging) {
+      console.log(chalk.yellow(
+        `node_modules has Storybook ${lagging.installed}, but ${lagging.lockfile} pins ${lagging.version}. ` +
+        `Installing will also bring node_modules up to date with ${lagging.lockfile}, so addon-mcp is matched to ${lagging.version}.`,
+      ));
+    }
+    const running = await findRunningStorybooks();
+    if (running.length) {
+      console.log(chalk.yellow(
+        `A Storybook is running at ${running.join(", ")}. If one is this project's, stop it before installing: ` +
+        `on Windows, files it holds open can make the install fail (EPERM). Start it again afterwards.`,
+      ));
+    }
     if (addonTooNew) {
       console.log(chalk.red(
         `@storybook/addon-mcp ${addonVersion} needs Storybook ${addonVersion} or later, ` +
@@ -436,6 +622,20 @@ async function checkAndFix(projectInput: string): Promise<void> {
     }
   }
 
+  if (needsDocgenServer) {
+    const yes = await confirm(`Turn on features.experimentalDocgenServer in .storybook/main config? (Vue needs it for the docs tools)`);
+    if (yes) {
+      const result = addFeatureToConfig(updatedContent, "experimentalDocgenServer");
+      if (result.ok) {
+        updatedContent = result.content;
+        configChanged = true;
+      } else {
+        console.log(chalk.yellow("  Couldn't find `features` or `framework` in your config. Add this manually:"));
+        console.log(chalk.dim(`    features: { experimentalDocgenServer: true }`));
+      }
+    }
+  }
+
   if (configChanged) {
     writeFileSync(config.path, updatedContent);
     console.log(chalk.green(`\n✔ Updated ${relative(projectPath, config.path)}`));
@@ -443,6 +643,6 @@ async function checkAndFix(projectInput: string): Promise<void> {
 
   if (configChanged || installed) {
     console.log(chalk.dim("\nRestart Storybook to apply changes, then run:"));
-    console.log(chalk.dim("  storysync list --storybook http://localhost:6006"));
+    console.log(chalk.dim("  storysync list"));
   }
 }

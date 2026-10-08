@@ -11,6 +11,7 @@ import {
   findComponent,
   toolResultText,
   StorybookClient,
+  MissingDocsToolsError,
   type DocsTools,
 } from "../storybook.js";
 
@@ -221,13 +222,11 @@ test("StorybookClient: reads components through addon-mcp 10.6's tool names", as
 test("StorybookClient: a server without the docs tools fails listComponents with setup advice", async () => {
   const client = await connectToFakeAddon(null);
   try {
-    await assert.rejects(client.listComponents(), /missing the docs tools[\s\S]*storysync init/);
-    // An upgrade command that runs whatever the project's package manager:
-    // npx ships with Node, and Storybook's upgrade finds the package manager
-    // itself. `pnpm dlx` is "command not found" on a machine without pnpm.
+    // A typed error, so the CLI can add advice from the project's own config
+    // (diagnoseMissingDocsTools) instead of always suggesting an upgrade.
     await assert.rejects(client.listComponents(), (err: Error) => {
-      assert.match(err.message, /upgrade with: npx storybook@latest upgrade$/);
-      assert.doesNotMatch(err.message, /pnpm/);
+      assert.ok(err instanceof MissingDocsToolsError);
+      assert.match(err.message, /has no docs tools/);
       return true;
     });
   } finally {

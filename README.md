@@ -367,7 +367,7 @@ Maps every component to Figma variant definitions.
 
 ```text
 Options:
-  --storybook <url>      URL of the running Storybook instance (required)
+  --storybook <url>      URL of the running Storybook instance (default: http://localhost:6006)
   --connect-timeout <ms> How long to wait for Storybook MCP to answer (default: 60000)
   --components <names>   Comma-separated component names or IDs (default: all);
                          a name that matches nothing is an error
@@ -382,7 +382,7 @@ Renders each component variant in a headless browser and records its computed st
 
 ```text
 Options:
-  --storybook <url>      URL of the running Storybook instance (required)
+  --storybook <url>      URL of the running Storybook instance (default: http://localhost:6006)
   --connect-timeout <ms> How long to wait for Storybook MCP to answer (default: 60000)
   --components <names>   Comma-separated component names or IDs (default: all);
                          a name that matches nothing is an error
@@ -485,7 +485,7 @@ Lists the components in Storybook. MDX docs pages, like an introduction, are lef
 
 ```text
 Options:
-  --storybook <url>      URL of the running Storybook instance (required)
+  --storybook <url>      URL of the running Storybook instance (default: http://localhost:6006)
   --connect-timeout <ms> How long to wait for Storybook MCP to answer (default: 60000)
 ```
 
@@ -533,7 +533,7 @@ Shows one component's props and how each maps to Figma.
 
 ```text
 Options:
-  --storybook <url>      URL of the running Storybook instance (required)
+  --storybook <url>      URL of the running Storybook instance (default: http://localhost:6006)
   --component <name>     Component name or ID to inspect (required);
                          a name that matches nothing is an error
   --connect-timeout <ms> How long to wait for Storybook MCP to answer (default: 60000)

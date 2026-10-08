@@ -37,6 +37,19 @@ export interface CapInfo {
   droppedSample: Record<string, string>[];
 }
 
+/**
+ * A prop that could look like a variant but isn't one: free text, a free
+ * number, or a type with no fixed values. Reported so a component with fewer
+ * variants than expected says why. Props that are never variants (children,
+ * callbacks, aria-*, class, style) aren't listed.
+ */
+export interface SkippedProp {
+  name: string;
+  type: string;
+  kind: SkipKind;
+  reason: string;
+}
+
 export interface FigmaComponentDefinition {
   name: string;
   title?: string;
@@ -45,6 +58,8 @@ export interface FigmaComponentDefinition {
   variantCombinations: Record<string, string>[];
   wasCapped: boolean;
   cap?: CapInfo;
+  /** Always set by mapComponent. */
+  skippedProps?: SkippedProp[];
 }
 
 export interface StorybookComponent {
@@ -100,19 +115,43 @@ export function resolveDefault(raw: unknown): string | null {
 }
 
 export function shouldSkip(prop: StorybookProp): boolean {
-  if (SKIP_PROPS.has(prop.name)) return true;
-  if (/^on[A-Z]/.test(prop.name)) return true;
-  if (prop.name.startsWith("aria-") || prop.name.startsWith("data-")) return true;
+  if (isStructural(prop)) return true;
 
   const t = prop.type.name;
-  if (CALLBACK_TYPES.some((p) => p.test(t))) return true;
-  if (NON_VISUAL_TYPES.some((p) => p.test(t))) return true;
-
   if (t === "string" || t === "number") {
     return !(prop.control?.options && prop.control.options.length > 0);
   }
 
   return false;
+}
+
+/**
+ * Never a variant: content, callbacks, attributes and refs. Not worth
+ * reporting. Vue's docs list slots and emitted events beside props with an
+ * empty type (`default ({})`, `remove ([])`); those are never variants either.
+ */
+function isStructural(prop: StorybookProp): boolean {
+  if (SKIP_PROPS.has(prop.name)) return true;
+  if (/^on[A-Z]/.test(prop.name)) return true;
+  if (prop.name.startsWith("aria-") || prop.name.startsWith("data-")) return true;
+  const t = prop.type.name;
+  if (/^\s*(\{\s*\}|\[\s*\])\s*$/.test(t)) return true;
+  return CALLBACK_TYPES.some((p) => p.test(t)) || NON_VISUAL_TYPES.some((p) => p.test(t));
+}
+
+/** The kinds of reason skipReason gives, for grouping in output. */
+export type SkipKind = "free-value" | "unresolved-type";
+
+/** Why a prop that might have been a variant isn't one, or null when it is one or never could be. */
+export function skipReason(prop: StorybookProp): { kind: SkipKind; reason: string } | null {
+  if (isStructural(prop)) return null;
+  if (mapProp(prop)) return null;
+  const t = prop.type.name;
+  const fix = "give it options in its argTypes to make it a variant";
+  if (t === "string") return { kind: "free-value", reason: `free text; ${fix}` };
+  if (t === "number") return { kind: "free-value", reason: `free number; ${fix}` };
+  // e.g. `ButtonSeverity`: a named union whose members the docs don't show.
+  return { kind: "unresolved-type", reason: `its type ${t} doesn't show its values to Storysync; list them as options in its argTypes` };
 }
 
 function isLiteral(member: PropType): boolean {
@@ -340,6 +379,11 @@ export function mapComponent(
 ): FigmaComponentDefinition {
   const variantProperties = component.props.map(mapProp).filter((v): v is FigmaVariantProperty => v != null);
   const { combinations, wasCapped, cap } = cartesian(variantProperties, maxCombinations);
+  const skippedProps: SkippedProp[] = [];
+  for (const prop of component.props) {
+    const skipped = skipReason(prop);
+    if (skipped) skippedProps.push({ name: prop.name, type: prop.type.name, ...skipped });
+  }
   return {
     name: component.name,
     title: component.title,
@@ -348,5 +392,6 @@ export function mapComponent(
     variantCombinations: combinations,
     wasCapped,
     ...(cap ? { cap } : {}),
+    skippedProps,
   };
 }

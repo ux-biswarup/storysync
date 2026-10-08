@@ -415,7 +415,8 @@ test("list CLI: a docs list that fails ends with the server's reason and exit 1,
 test("list CLI: a Storybook without the docs tools gets the setup advice, not a stack trace", async () => {
   const r = await run("list", "--storybook", noDocs.url);
   assert.equal(r.status, 1, r.out);
-  assert.match(r.out, /Storybook MCP is missing the docs tools[\s\S]*storysync init/);
+  // Run from a folder with no .storybook/, so the advice says where to run it.
+  assert.match(r.out, /Storybook MCP is running, but it has no docs tools[\s\S]*storysync init/);
   assert.doesNotMatch(r.out, STACK);
 });
 
@@ -428,7 +429,9 @@ test("map CLI: a docs list that fails ends with the reason, as JSON under --json
 
   const json = await run("map", "--storybook", noDocs.url, "--json");
   assert.equal(json.status, 1, json.out);
-  assert.match((JSON.parse(json.stdout) as { error: string }).error, /missing the docs tools/);
+  const parsed = JSON.parse(json.stdout) as { error: string; advice?: string[] };
+  assert.match(parsed.error, /has no docs tools/);
+  assert.ok(parsed.advice?.length, "the advice comes along under --json");
 });
 
 test("inspect CLI: a name that matches nothing names what exists, without asking for its documentation", async () => {

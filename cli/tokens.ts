@@ -1,7 +1,7 @@
 // Design token extraction from project source files.
 
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { colorToHex } from "./color.js";
 
 /** The token sources `--source` takes. Leaving it out, or `auto`, detects one. */
@@ -65,6 +65,8 @@ export function parseTokenSource(value: string | undefined): TokenSourceType | u
 interface DetectedSource {
   type: TokenSourceType;
   path: string;
+  /** Why this source was picked, in words for the user. */
+  reason: string;
 }
 
 const TAILWIND_CONFIGS = ["tailwind.config.ts", "tailwind.config.js", "tailwind.config.mjs", "tailwind.config.cjs"];
@@ -86,18 +88,62 @@ function findTailwindConfig(projectPath: string): string | null {
  */
 export function detectTokenSource(projectPath: string): DetectedSource | null {
   const config = findTailwindConfig(projectPath);
-  if (config) return { type: "tailwind", path: config };
+  // A Tailwind v4 project often keeps a config only for content paths and
+  // plugins, its tokens being in CSS. Such a config has no tokens to read, so
+  // it no longer hides the CSS that does.
+  const stub = config != null && !hasTailwindTheme(config);
+  if (config && !stub) return { type: "tailwind", path: config, reason: "Tailwind config with a theme" };
+  const passedOver = stub ? `${relativeName(projectPath, config)} has no theme, so its tokens must be in CSS; ` : "";
 
   const cssFiles = findCSSWithCustomProperties(projectPath);
-  if (cssFiles.length) return { type: "css", path: cssFiles[0] };
+  if (cssFiles.length) return { type: "css", path: cssFiles[0], reason: `${passedOver}reading :root custom properties` };
 
   const themeCss = findTailwindThemeCSS(projectPath);
-  if (themeCss.length) return { type: "tailwind", path: themeCss[0] };
+  if (themeCss.length) return { type: "tailwind", path: themeCss[0], reason: `${passedOver}reading Tailwind v4 @theme blocks` };
 
   const themeFile = findThemeFile(projectPath);
-  if (themeFile) return { type: "theme", path: themeFile };
+  if (themeFile) return { type: "theme", path: themeFile, reason: `${passedOver}reading a theme file` };
 
+  if (config) return { type: "tailwind", path: config, reason: "Tailwind config; it has no theme, and no other token source was found" };
   return null;
+}
+
+/** Whether a Tailwind config declares a `theme`, outside comments. A v4 stub doesn't. */
+export function hasTailwindTheme(configPath: string): boolean {
+  try {
+    return /(^|[\s,{])["']?theme["']?\s*:/m.test(stripComments(readFileSync(configPath, "utf8")));
+  } catch {
+    return true;
+  }
+}
+
+function relativeName(projectPath: string, path: string): string {
+  return relative(resolve(projectPath), path) || path;
+}
+
+/**
+ * The extraction's warnings with the "Uncategorized" ones grouped by name
+ * prefix, so 300 variables a library names its own way read as a few lines.
+ * A group is the name without its last segment: `--aura-primitive-border-radius-xs`
+ * goes under `--aura-primitive-border-radius-*`. Largest groups first.
+ */
+export function summarizeUncategorized(warnings: string[]): { groups: { prefix: string; count: number }[]; uncategorized: number; other: string[] } {
+  const counts = new Map<string, number>();
+  const other: string[] = [];
+  let uncategorized = 0;
+  for (const w of warnings) {
+    const m = /^Uncategorized: (--[\w-]+):/.exec(w);
+    if (!m) {
+      other.push(w);
+      continue;
+    }
+    uncategorized++;
+    const parts = m[1].slice(2).split("-");
+    const prefix = parts.length > 1 ? `--${parts.slice(0, -1).join("-")}-*` : m[1];
+    counts.set(prefix, (counts.get(prefix) ?? 0) + 1);
+  }
+  const groups = [...counts].map(([prefix, count]) => ({ prefix, count })).sort((a, b) => b.count - a.count || a.prefix.localeCompare(b.prefix));
+  return { groups, uncategorized, other };
 }
 
 function findCSSWithCustomProperties(projectPath: string): string[] {
@@ -220,10 +266,13 @@ function extractFromSource(projectPath: string, sourceType?: TokenSourceType): T
   if (sourceType) {
     switch (sourceType) {
       case "tailwind": {
+        // A config with a theme, else @theme blocks, else a themeless config:
+        // a v4 stub config holds no tokens, and the CSS beside it does.
         const config = findTailwindConfig(projectPath);
-        if (config) return extractFromTailwind(config, projectPath);
+        if (config && hasTailwindTheme(config)) return extractFromTailwind(config, projectPath);
         const themeCss = findTailwindThemeCSS(projectPath);
         if (themeCss.length) return extractFromTailwindTheme(themeCss, projectPath);
+        if (config) return extractFromTailwind(config, projectPath);
         return { source: "tailwind", sourcePath: "", collections: [], warnings: ["No tailwind.config or CSS @theme block found"] };
       }
       case "css": {
