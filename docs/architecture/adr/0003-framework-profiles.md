@@ -1,6 +1,7 @@
 # 0003. Describe framework requirements as data profiles
 
-**Status:** Proposed
+**Status:** Accepted
+**Deciders:** Biswarup Mondal (approved by starting Phase 2, 2026-10-08)
 **Date:** 2026-10-07
 **Solves:** A2
 

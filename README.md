@@ -301,9 +301,57 @@ Props come from the Props section of the component's Storybook docs. Subcomponen
 
 ## CLI reference
 
-The CLI handles setup (`init`, `setup`) and gives deterministic output you can check locally or in CI (`tokens`, `map`, `snap`, `verify`, `list`, `inspect`, `diff`). It never writes to Figma itself. Your AI client does that, using the skill.
+The CLI handles setup (`start`, `init`, `setup`, `doctor`), previews (`plan`) and gives deterministic output you can check locally or in CI (`tokens`, `map`, `snap`, `verify`, `list`, `inspect`, `diff`). It never writes to Figma itself. Your AI client does that, using the skill.
 
 A command that can't reach Storybook (or Figma, for `diff`) exits 1. So does one whose server accepts the connection but doesn't answer within `--connect-timeout` (default 60000 ms). With `--json`, the error is printed as JSON, `{"error": "..."}`, so scripts can still parse it.
+
+### `npx storysync` (no command), or `storysync start`
+
+Sets a project up step by step, asking before every change:
+
+1. **Storybook**: everything `storysync init` does, including the flags your framework needs
+2. **Settings**: your Storybook's URL, where your design tokens are, and your Figma file, saved to `storysync.config.json`
+3. **AI client**: the skill files, and Storybook MCP registered with Claude Code, Cursor or Codex
+4. **Check**: `storysync doctor`, ending in "Ready" or a list of exact fixes
+
+Outside a project, `npx storysync` shows this help instead.
+
+### `storysync.config.json`
+
+Settings you'd otherwise pass on every command. Put it in your project's root; commands find it from any folder below. Every setting can still be given by a flag, which wins, then an environment variable, then this file, then the default.
+
+```json
+{
+  "$schema": "./node_modules/storysync/schema.json",
+  "storybook": { "url": "http://localhost:6007" },
+  "framework": "vue3-vite",
+  "tokens": { "source": "css" },
+  "components": { "include": ["Button", "Tag"], "maxCombinations": 64 },
+  "figma": { "fileKey": "abc123XYZ" }
+}
+```
+
+| Setting | Flag | Environment variable |
+|---|---|---|
+| `storybook.url` | `--storybook` (not taken from config by `diff`, where it turns on the component diff) | `STORYSYNC_STORYBOOK_URL` |
+| `framework` | | |
+| `tokens.source` | `--source` | |
+| `components.include` | `--components` | |
+| `components.maxCombinations` | `--max-combinations` | |
+| `figma.fileKey` | `--file-key` | `STORYSYNC_FIGMA_FILE_KEY` |
+
+An unknown key or a wrong value stops the command and names the problem.
+
+### `storysync doctor`
+
+Checks every link from your project to a working sync and says how to fix each one that's broken: Node, the config file, Storybook's version and framework, addon-mcp, the framework's flags, the running Storybook, its MCP docs tools, the browser `snap` uses, your design tokens, and Claude Code. Exits 1 when anything fails.
+
+```text
+Options:
+  --project <path>     Storybook project root (default: ".")
+  --storybook <url>    Storybook URL (default: http://localhost:6006, or the config file's)
+  --json               Output JSON instead of formatted text
+```
 
 ### `storysync init`
 
@@ -325,7 +373,13 @@ Options:
   --client <name>      AI client: claude, cursor, or codex (required)
   --project <path>     Project root path (default: ".")
   --force              Overwrite existing files
+  --register-mcp       Register Storybook MCP with the client, instead of printing how
+  --replace-mcp        With --register-mcp: replace a storybook server the client already has
+                       that points elsewhere (kept and reported otherwise)
+  --storybook <url>    Storybook URL to register (default: the config file's, or http://localhost:6006)
 ```
+
+With `--register-mcp`, Claude Code gets `claude mcp add` for this project, Cursor gets an entry in `.cursor/mcp.json`, and Codex one in `.codex/config.toml`. Claude Code keeps these per git repository, so a worktree shares its main checkout's: a different existing entry is never replaced without `--replace-mcp`.
 
 ```bash
 npx storysync setup --client claude
@@ -334,6 +388,20 @@ npx storysync setup --client cursor
 # writes .cursor/rules/storysync.mdc
 npx storysync setup --client codex
 # writes .agents/skills/storysync/SKILL.md
+```
+
+### `storysync plan`
+
+Previews what a push would create in Figma, without writing anything: token collections and counts, components and their variants, props that won't become variants and why, caps, and your framework's known limits. If Storybook can't be reached, it still plans the tokens and says why components are missing.
+
+```text
+Options:
+  --storybook <url>        Storybook URL (default: the config file's, or http://localhost:6006)
+  --project <path>         Project root to scan for tokens (default: ".")
+  --source <type>          Token source: tailwind, css, or theme
+  --components <names>     Comma-separated component names or IDs
+  --max-combinations <n>   Most combinations per component before capping (default: 256)
+  --json                   Output JSON instead of formatted text
 ```
 
 ### `storysync tokens`
@@ -587,7 +655,18 @@ Storysync splits deterministic extraction (the CLI) from Figma writes (the AI cl
 
 ### Storybook (for components)
 
-- **Storybook 10.1+** with a Vite-based framework (`@storybook/react-vite`, `@storybook/nextjs-vite`, or `@storybook/sveltekit`). Storybook 9 supports token extraction only.
+- **Storybook 10.1+** with one of the frameworks below. Storybook 9 supports token extraction only. `storysync doctor` tells you whether your project is ready.
+
+<!-- support-matrix:start (generated from cli/frameworks.ts: pnpm docs:support) -->
+| Framework | Package | Status | Flags it needs | Prop types | Notes |
+|---|---|---|---|---|---|
+| React (Vite) | `@storybook/react-vite` | ✅ Supported | none | Full (react-docgen) |  |
+| Vue 3 (Vite) | `@storybook/vue3-vite` | ✅ Supported | `experimentalDocgenServer` (`storysync init` adds it) | Partial (vue-component-meta, on the server) | Props typed with a named union (e.g. severity: ButtonSeverity) don't show their values, so they aren't variants unless their argTypes list options. |
+| Next.js (Vite) | `@storybook/nextjs-vite` | Works | none | Full (react-docgen) |  |
+| SvelteKit | `@storybook/sveltekit` | Works | none | Unknown (svelte) |  |
+| Angular | `@storybook/angular` | Not tested yet | none | Unknown (compodoc) | Not yet tested with Storysync (plan spike S3). |
+| Web Components (Vite) | `@storybook/web-components-vite` | Not tested yet | none | Unknown (custom elements manifest) | Not yet tested with Storysync (plan spike S3). |
+<!-- support-matrix:end -->
 - **`@storybook/addon-mcp`**, which serves MCP at `/mcp`. `storysync init` sets it up.
 - The **dev server** (`storybook dev`), not a static build.
 - **Node.js 18+**, or 20+ for `snap`.

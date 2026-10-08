@@ -3,6 +3,7 @@
 import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import chalk from "chalk";
 
 export type Client = "claude" | "cursor" | "codex";
@@ -210,7 +211,137 @@ function setupCodex(projectPath: string, force: boolean): SetupResult {
   };
 }
 
-export function runSetup(client: Client, projectInput: string, force: boolean): void {
+/** Runs a command, as registerMcp needs it; injected so tests don't touch the real clients. */
+export type Exec = (command: string, args: string[], cwd: string) => { status: number | null; stdout: string };
+
+/** The real Exec: through a shell, so Windows finds `.cmd` shims such as claude.cmd as well as `.exe`s. */
+export const shellExec: Exec = (command, args, cwd) => {
+  const quoted = [command, ...args].map((a) => (/^[\w@/:.=+-]+$/.test(a) ? a : `"${a.replace(/"/g, '\\"')}"`)).join(" ");
+  const r = spawnSync(quoted, { cwd, shell: true, encoding: "utf8", timeout: 90_000 });
+  return { status: r.status, stdout: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+};
+
+export interface RegisterResult {
+  /** What was done, one line each, for the user. */
+  done: string[];
+  /** What the user still has to do, or should know. */
+  notes: string[];
+  ok: boolean;
+  /**
+   * The client already has a server named storybook that points elsewhere,
+   * and `replace` wasn't given, so it was kept. The caller can ask the user,
+   * then call again with `replace`.
+   */
+  conflict?: { current: string; wanted: string };
+}
+
+/**
+ * Registers Storybook MCP with the client for this project (plan item 2.4),
+ * instead of printing the command for the user to run:
+ * - Claude Code: `claude mcp add` in the project (its default, local scope),
+ *   and says whether a Figma connector or plugin is there. Claude Code keeps
+ *   local servers per git repository, so a worktree shares its main
+ *   checkout's: never replaced without `replace`.
+ * - Cursor: merges the server into .cursor/mcp.json.
+ * - Codex: adds it to the project's .codex/config.toml.
+ * A server named storybook that points elsewhere is kept, and reported as a
+ * conflict, unless `replace` is set.
+ */
+export function registerMcp(client: Client, projectInput: string, storybookUrl: string, exec: Exec = shellExec, replace = false): RegisterResult {
+  const projectPath = resolve(projectInput);
+  const mcpUrl = new URL("/mcp", storybookUrl).toString();
+  const done: string[] = [];
+  const notes: string[] = [];
+  const conflict = (current: string, where: string): RegisterResult => ({
+    done,
+    notes: [`${where} already has a storybook server pointing at ${current}, so it was kept. To use ${mcpUrl} instead, run: storysync setup --client ${client} --register-mcp --replace-mcp --storybook ${storybookUrl}`],
+    ok: true,
+    conflict: { current, wanted: mcpUrl },
+  });
+
+  if (client === "claude") {
+    const existing = exec("claude", ["mcp", "get", "storybook"], projectPath);
+    // Not installed: the shell can't find it. (A missing server is "No MCP server found", exit 1.)
+    if (existing.status === null || /is not recognized as an internal|command not found/i.test(existing.stdout)) {
+      return { done, notes: ["Claude Code isn't installed or isn't on PATH. Install it, then run: storysync setup --client claude --register-mcp"], ok: false };
+    }
+    const current = existing.status === 0 ? /URL:\s*(\S+)/.exec(existing.stdout)?.[1] ?? "another URL" : null;
+    if (current === mcpUrl) {
+      done.push(`Storybook MCP already registered in Claude Code (${mcpUrl})`);
+    } else {
+      if (current && !replace) return conflict(current, "Claude Code");
+      if (current) {
+        exec("claude", ["mcp", "remove", "storybook"], projectPath);
+        done.push(`Removed Claude Code's storybook server (${current}), as asked`);
+      }
+      const add = exec("claude", ["mcp", "add", "--transport", "http", "storybook", mcpUrl], projectPath);
+      if (add.status !== 0) {
+        return { done, notes: [`claude mcp add failed: ${add.stdout.trim().split("\n")[0]}`, `Run it yourself: claude mcp add --transport http storybook ${mcpUrl}`], ok: false };
+      }
+      done.push(`Registered Storybook MCP in Claude Code for this project (${mcpUrl})`);
+    }
+    // "No MCP server found" already lists every configured server; otherwise
+    // ask for the list (slower: it checks each server's health).
+    const servers = /Configured servers:/.test(existing.stdout) ? existing.stdout : exec("claude", ["mcp", "list"], projectPath).stdout;
+    if (/figma/i.test(servers)) done.push("Figma is available in Claude Code");
+    else notes.push("No Figma server in Claude Code. Add one: claude plugin install figma@claude-plugins-official");
+    return { done, notes, ok: true };
+  }
+
+  if (client === "cursor") {
+    const path = join(projectPath, ".cursor", "mcp.json");
+    let config: { mcpServers?: Record<string, unknown> } = {};
+    if (existsSync(path)) {
+      try {
+        config = JSON.parse(readFileSync(path, "utf8"));
+      } catch {
+        return { done, notes: [`${relative(projectPath, path)} isn't valid JSON, so it was left alone. Add: "storybook": { "url": "${mcpUrl}" }`], ok: false };
+      }
+    }
+    const current = (config.mcpServers?.storybook as { url?: string } | undefined)?.url;
+    if (current === mcpUrl) {
+      done.push(`Storybook MCP already in ${relative(projectPath, path)}`);
+    } else {
+      if (current && !replace) return conflict(current, relative(projectPath, path));
+      config.mcpServers = { ...(config.mcpServers ?? {}), storybook: { url: mcpUrl } };
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+      done.push(`${current ? `Replaced ${current} with` : "Added"} Storybook MCP in ${relative(projectPath, path)} (${mcpUrl})`);
+    }
+    notes.push("Add Figma: in Cursor's Agent chat, run /add-plugin figma and sign in when prompted");
+    return { done, notes, ok: true };
+  }
+
+  const path = join(projectPath, ".codex", "config.toml");
+  const toml = existsSync(path) ? readFileSync(path, "utf8") : "";
+  const block = /^\[mcp_servers\.storybook\]\s*\n(?:(?!\[)[^\n]*\n?)*/m.exec(toml);
+  if (block && block[0].includes(`"${mcpUrl}"`)) {
+    done.push(`Storybook MCP already in ${relative(projectPath, path)}`);
+  } else {
+    if (block && !replace) return conflict(/url\s*=\s*"([^"]+)"/.exec(block[0])?.[1] ?? "another URL", relative(projectPath, path));
+    const entry = `[mcp_servers.storybook]\nurl = "${mcpUrl}"\n`;
+    const next = block ? toml.replace(block[0], entry) : `${toml}${toml && !toml.endsWith("\n") ? "\n" : ""}${toml ? "\n" : ""}${entry}`;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, next);
+    done.push(`${block ? "Replaced" : "Added"} Storybook MCP in ${relative(projectPath, path)} (${mcpUrl}); Codex reads it once you trust the project`);
+  }
+  notes.push("Add Figma: codex mcp add figma --url https://mcp.figma.com/mcp (or the Figma plugin, from /plugins)");
+  return { done, notes, ok: true };
+}
+
+export interface SetupOptions {
+  /** Register Storybook MCP with the client instead of printing how. */
+  registerMcp?: boolean;
+  /** Replace a storybook server the client already has that points elsewhere. */
+  replaceMcp?: boolean;
+  /** The Storybook URL to register, already resolved by precedence. */
+  storybookUrl?: string;
+  exec?: Exec;
+  /** Asked when the client already has a different storybook server; replaces it on yes. */
+  confirmReplace?: (current: string, wanted: string) => Promise<boolean>;
+}
+
+export async function runSetup(client: Client, projectInput: string, force: boolean, options: SetupOptions = {}): Promise<void> {
   const projectPath = resolve(projectInput);
 
   console.log(chalk.bold(`\nstorysync setup — ${client}`));
@@ -224,9 +355,23 @@ export function runSetup(client: Client, projectInput: string, force: boolean): 
   for (const f of result.written) console.log(`  ${chalk.green("✔")} wrote ${f}`);
   for (const f of result.skipped) console.log(`  ${chalk.dim("•")} ${chalk.dim(f)} ${chalk.dim("(exists, use --force to overwrite)")}`);
 
-  if (result.notes.length) {
+  let notes = result.notes;
+  if (options.registerMcp) {
+    const url = options.storybookUrl ?? "http://localhost:6006";
+    let reg = registerMcp(client, projectPath, url, options.exec, !!options.replaceMcp);
+    // A different storybook server is never replaced silently: ask, when we can.
+    if (reg.conflict && options.confirmReplace && await options.confirmReplace(reg.conflict.current, reg.conflict.wanted)) {
+      reg = registerMcp(client, projectPath, url, options.exec, true);
+    }
+    for (const d of reg.done) console.log(`  ${chalk.green("✔")} ${d}`);
+    if (!reg.ok) process.exitCode = 1;
+    // The printed MCP commands are what registering just did; keep the rest.
+    notes = [...reg.notes, ...notes.filter((n) => !/MCP|mcp\.json|mcpServers|mcp add|\/add-plugin|plugin install/.test(n))];
+  }
+
+  if (notes.length) {
     console.log(`\n${chalk.bold("Next steps:")}`);
-    for (const n of result.notes) console.log(`  ${chalk.dim(n)}`);
+    for (const n of notes) console.log(`  ${chalk.dim(n)}`);
   }
 
   console.log("");

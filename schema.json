@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ux-biswarup/storysync/blob/main/schema.json",
+  "title": "storysync.config.json",
+  "description": "Project settings for Storysync. Every setting can also come from a flag or an environment variable; the order is flag, environment variable, this file, default.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "storybook": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "The running Storybook (dev server). Default http://localhost:6006. Env: STORYSYNC_STORYBOOK_URL. Flag: --storybook."
+        }
+      }
+    },
+    "framework": {
+      "type": "string",
+      "enum": ["react-vite", "vue3-vite", "nextjs-vite", "sveltekit", "angular", "web-components-vite"],
+      "description": "The Storybook framework, when detection from .storybook/main gets it wrong."
+    },
+    "tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["tailwind", "css", "theme"],
+          "description": "Where design tokens are read from. Detected when left out. Flag: --source."
+        }
+      }
+    },
+    "components": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "include": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Component names or IDs to work with. All when left out. Flag: --components."
+        },
+        "maxCombinations": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Most variant combinations per component before capping. Default 256. Flag: --max-combinations."
+        }
+      }
+    },
+    "figma": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fileKey": {
+          "type": "string",
+          "pattern": "^[0-9a-zA-Z]{10,128}$",
+          "description": "The Figma file to sync with: the part of its URL after /design/. Env: STORYSYNC_FIGMA_FILE_KEY. Flag: --file-key."
+        }
+      }
+    }
+  }
+}

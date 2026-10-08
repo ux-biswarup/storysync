@@ -6,6 +6,7 @@ import { execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { Interface } from "node:readline";
 import chalk from "chalk";
+import { frameworkProfile, missingFeatures } from "./frameworks.js";
 
 export type PackageManager = "pnpm" | "yarn" | "bun" | "npm";
 
@@ -355,7 +356,7 @@ export async function findRunningStorybooks(
 }
 
 /** Feature flags `features` sets to true in a Storybook main config, outside comments. */
-function enabledFeatures(configContent: string): Set<string> {
+export function enabledFeatures(configContent: string): Set<string> {
   const masked = maskComments(configContent);
   const on = new Set<string>();
   for (const m of masked.matchAll(/(["']?)(\w+)\1\s*:\s*true\b/g)) on.add(m[2]);
@@ -399,7 +400,9 @@ export function diagnoseMissingDocsTools(projectPath: string): string[] {
   const addonEnablesManifest = addon != null && compareVersions(addon, FIRST_LOCKSTEP) >= 0;
   const missing: string[] = [];
   if (!addonEnablesManifest && !features.has("componentsManifest") && !features.has("experimentalComponentsManifest")) missing.push("componentsManifest: true");
-  if (framework === "@storybook/vue3-vite" && !features.has("experimentalDocgenServer")) missing.push("experimentalDocgenServer: true");
+  const profile = frameworkProfile(framework);
+  const frameworkMissing = missingFeatures(profile, features);
+  for (const f of frameworkMissing) missing.push(`${f}: true`);
   const file = relative(projectPath, config.path);
   if (!missing.length) {
     return [
@@ -407,9 +410,8 @@ export function diagnoseMissingDocsTools(projectPath: string): string[] {
       "Restart Storybook if you changed its config since it started, and check addon-mcp is registered: `storysync init`.",
     ];
   }
-  const why = framework === "@storybook/vue3-vite" && missing.some((m) => m.startsWith("experimentalDocgenServer"))
-    ? " (@storybook/vue3-vite builds its component manifest only with experimentalDocgenServer)"
-    : "";
+  const reasons = frameworkMissing.map((f) => profile?.featureReasons[f]).filter(Boolean);
+  const why = reasons.length ? ` (${reasons.join("; ")})` : "";
   return [
     `Storybook ${version} is new enough. The docs tools are off because ${file} doesn't turn on the component manifest${why}.`,
     `Add to ${file}:  features: { ${missing.join(", ")} }`,
@@ -423,24 +425,38 @@ export function diagnoseMissingDocsTools(projectPath: string): string[] {
 // so init exited without registering the addon.
 let answers: { rl: Interface; lines: AsyncIterableIterator<string> } | null = null;
 
-async function confirm(message: string): Promise<boolean> {
-  process.stdout.write(`${message} ${chalk.dim("[Y/n]")} `);
+/** The next line of input, or null when input has ended. */
+async function nextAnswer(): Promise<string | null> {
   if (!answers) {
     const rl = createInterface({ input: process.stdin, terminal: false });
     answers = { rl, lines: rl[Symbol.asyncIterator]() };
   }
   const next = await answers.lines.next();
-  if (next.done) {
+  return next.done ? null : next.value;
+}
+
+export async function confirm(message: string, defaultYes = true): Promise<boolean> {
+  process.stdout.write(`${message} ${chalk.dim(defaultYes ? "[Y/n]" : "[y/N]")} `);
+  const line = await nextAnswer();
+  if (line === null) {
     // Input ended with no answer: nothing was agreed to.
     process.stdout.write("\n");
     return false;
   }
-  const a = next.value.trim().toLowerCase();
-  return a === "" || a === "y" || a === "yes";
+  const a = line.trim().toLowerCase();
+  return a === "" ? defaultYes : a === "y" || a === "yes";
+}
+
+/** Asks for a value; an empty answer, or input that has ended, takes the default. */
+export async function ask(message: string, defaultValue: string): Promise<string> {
+  process.stdout.write(`${message}${defaultValue ? ` ${chalk.dim(`[${defaultValue}]`)}` : ""} `);
+  const line = await nextAnswer();
+  if (line === null) process.stdout.write("\n");
+  return line?.trim() || defaultValue;
 }
 
 /** Stops reading stdin, if a prompt started to, so the process can exit. */
-function closeAnswers(): void {
+export function closeAnswers(): void {
   answers?.rl.close();
   answers = null;
 }
@@ -518,7 +534,8 @@ export async function runInit(projectInput: string): Promise<void> {
   }
 }
 
-async function checkAndFix(projectInput: string): Promise<void> {
+/** init's checks and fixes, without closing input: the wizard asks more afterwards. */
+export async function checkAndFix(projectInput: string): Promise<void> {
   const projectPath = resolve(projectInput);
   console.log(chalk.bold("\nstorysync init"));
   console.log(chalk.dim(`Project: ${projectPath}\n`));
@@ -549,19 +566,22 @@ async function checkAndFix(projectInput: string): Promise<void> {
   // Installed, but a release for a newer Storybook, so it doesn't load.
   const addonTooNew = addonMcpNeedsNewerStorybook(addonVersion, sbVersion);
   const inConfig = hasAddonMcpInConfig(config.content);
-  // @storybook/vue3-vite builds no component manifest, so addon-mcp offers
-  // no docs tools, unless docgen runs on the server.
-  const isVue = configFramework(config.content) === "@storybook/vue3-vite";
-  const needsDocgenServer = isVue && !enabledFeatures(config.content).has("experimentalDocgenServer");
+  // Flags this framework needs for the docs tools (e.g. Vue's
+  // experimentalDocgenServer), from its profile.
+  const profile = frameworkProfile(configFramework(config.content));
+  const missingFlags = missingFeatures(profile, enabledFeatures(config.content));
 
   const addonMark = addonTooNew ? chalk.red("✖") : hasAddon ? chalk.green("✔") : chalk.yellow("✖");
   console.log(`${sbOk ? chalk.green("✔") : chalk.red("✖")} Storybook 10.1+ ${chalk.dim(sbVersion ? `(found ${sbVersion})` : "(not found)")}`);
   console.log(`${addonMark} @storybook/addon-mcp installed${addonVersion ? ` ${chalk.dim(`(found ${addonVersion})`)}` : ""}`);
   console.log(`${inConfig ? chalk.green("✔") : chalk.yellow("✖")} addon-mcp registered in addons array`);
-  if (isVue) console.log(`${needsDocgenServer ? chalk.yellow("✖") : chalk.green("✔")} experimentalDocgenServer on ${chalk.dim("(Vue needs it for the docs tools)")}`);
+  for (const flag of profile?.requiredFeatures ?? []) {
+    const on = !missingFlags.includes(flag);
+    console.log(`${on ? chalk.green("✔") : chalk.yellow("✖")} ${flag} on ${chalk.dim(`(${profile!.label} needs it for the docs tools)`)}`);
+  }
   console.log("");
 
-  if (sbOk && hasAddon && !addonTooNew && inConfig && !needsDocgenServer) {
+  if (sbOk && hasAddon && !addonTooNew && inConfig && !missingFlags.length) {
     console.log(chalk.green("Everything looks good. Restart Storybook if it's running."));
     return;
   }
@@ -622,16 +642,16 @@ async function checkAndFix(projectInput: string): Promise<void> {
     }
   }
 
-  if (needsDocgenServer) {
-    const yes = await confirm(`Turn on features.experimentalDocgenServer in .storybook/main config? (Vue needs it for the docs tools)`);
+  for (const flag of missingFlags) {
+    const yes = await confirm(`Turn on features.${flag} in .storybook/main config? (${profile!.label} needs it for the docs tools)`);
     if (yes) {
-      const result = addFeatureToConfig(updatedContent, "experimentalDocgenServer");
+      const result = addFeatureToConfig(updatedContent, flag);
       if (result.ok) {
         updatedContent = result.content;
         configChanged = true;
       } else {
         console.log(chalk.yellow("  Couldn't find `features` or `framework` in your config. Add this manually:"));
-        console.log(chalk.dim(`    features: { experimentalDocgenServer: true }`));
+        console.log(chalk.dim(`    features: { ${flag}: true }`));
       }
     }
   }

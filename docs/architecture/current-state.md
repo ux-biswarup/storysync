@@ -176,6 +176,7 @@ Each problem links to evidence from the [Vue field test](../research/2026-10-07-
 | A8 | **No presentation layer.** Results are terminal text, formatted inside `index.ts`, or raw JSON. | No way to show users what will happen before it happens, and nothing for a UI to build on | [index.ts](../../cli/index.ts) |
 | A9 | **Skipped props are silent.** `mapper.ts` drops `string` props without telling the user. | Components appear with fewer variants than expected, or none (Badge) | Step 11 |
 | A10 | **Prop data depends on parsing markdown.** `storybook.ts` parses the docs tools' markdown. | Can break whenever addon-mcp changes its wording; it already changed tool names at 10.6. | [storybook.ts:121-135](../../cli/storybook.ts#L121-L135) |
+| A11 | **Named union types hide their values.** A prop typed with a named union (`severity: ButtonSeverity`, where `ButtonSeverity = 'primary' | 'danger' | …`) reaches Storysync as just the type's name: Vue's docs don't spell out the members, and the mapper can only expand literal unions. | Most of a design system's real variants go missing. In the Vue library, Badge has no variants and Button loses `severity` and `variant`. Users see fewer Figma variants than their components have. | [Phase 1 field test, N1](../research/2026-10-07-vue-library-phase1-field-test.md); [mapper.ts:146](../../cli/mapper.ts#L146) |
 
 ## Constraints we don't control
 

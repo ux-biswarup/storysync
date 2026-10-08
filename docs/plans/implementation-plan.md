@@ -86,16 +86,17 @@ No decisions needed. Each item is a small, testable PR.
 
 | # | Item | Solves | Depends on | Size |
 |---|---|---|---|---|
-| 2.1 | **`storysync.config.json` + JSON Schema**, loaded by every command. Precedence: flag > env > config > detection. | A5 | ADR 0004 | M |
-| 2.2 | **`storysync doctor`** checks every link: Node, Chromium, Storybook reachable, source type, MCP tools, framework flags, token sources, Figma auth. Each line is ✅ or a named fix. `--json` for CI. | Journey: Push | 2.1, 2.3 | M |
-| 2.3 | **Framework profiles** as data: `react-vite`, `nextjs-vite`, `vue3-vite`, `sveltekit`. Used by `init`, `doctor` and errors. | A2 | ADR 0003 | M |
-| 2.4 | **`setup` registers MCP itself** (`claude mcp add`, Cursor's `mcp.json`, Codex's `config.toml`) after confirming with the user, and checks that the Figma connector is present | Journey: Push | | S |
-| 2.5 | **`storysync plan`** previews a push: token collections and counts, components, variant counts, skipped props, caps, font warnings. Writes nothing. | A9, UX principle 2 | 2.6 | M |
-| 2.6 | **Move command logic into app services that return result objects**; `index.ts` becomes wiring plus a text renderer. One command per PR. | A8 | | L |
-| 2.7 | **Generate the README's support matrix from the profiles.** Add a "will this work for me?" section that points to `doctor`. | Journey: Discover | 2.3 | S |
-| 2.8 | **Wizard: `npx storysync` with no arguments.** Detects the framework and Storybook, applies the profile's fixes (asking first), writes the config, registers MCP, then runs `doctor`. | Journey: Install, Connect | 2.1-2.4 | M |
+| 2.1 | ✅ **`storysync.config.json` + JSON Schema**, loaded by every command. Precedence: flag > env > config > detection. | A5 | ADR 0004 | M |
+| 2.2 | ✅ **`storysync doctor`** checks every link: Node, Chromium, Storybook reachable, source type, MCP tools, framework flags, token sources, Figma auth. Each line is ✅ or a named fix. `--json` for CI. | Journey: Push | 2.1, 2.3 | M |
+| 2.3 | ✅ **Framework profiles** as data: `react-vite`, `nextjs-vite`, `vue3-vite`, `sveltekit`. Used by `init`, `doctor` and errors. | A2 | ADR 0003 | M |
+| 2.4 | ✅ **`setup` registers MCP itself** (`claude mcp add`, Cursor's `mcp.json`, Codex's `config.toml`) after confirming with the user, and checks that the Figma connector is present | Journey: Push | | S |
+| 2.5 | ✅ **`storysync plan`** previews a push: token collections and counts, components, variant counts, skipped props, caps, font warnings. Writes nothing. | A9, UX principle 2 | 2.6 | M |
+| 2.6 | ✅ **Move command logic into app services that return result objects**; `index.ts` becomes wiring plus a text renderer. One command per PR. | A8 | | L |
+| 2.7 | ✅ **Generate the README's support matrix from the profiles.** Add a "will this work for me?" section that points to `doctor`. | Journey: Discover | 2.3 | S |
+| 2.8 | ✅ **Wizard: `npx storysync` with no arguments.** Detects the framework and Storybook, applies the profile's fixes (asking first), writes the config, registers MCP, then runs `doctor`. | Journey: Install, Connect | 2.1-2.4 | M |
 
 **Phase 2 acceptance:** on a fresh clone of the example and of the Vue library, `npx storysync` followed by `npx storysync doctor` ends all ✅ with no hand edits.
+**✅ Met** on 2026-10-08: [acceptance runs](../research/2026-10-08-phase2-acceptance.md). Example: 11 ok, Vue library: 13 ok, 0 warnings, 0 failed. Found and fixed: registering MCP must never replace a different existing entry (Claude Code shares them across worktrees).
 
 ## Phase 3: Reach
 
@@ -106,7 +107,7 @@ No decisions needed. Each item is a small, testable PR.
 | 3.1 | *(With hosting)* **`StorybookSource` interface + `StaticSource`**: catalogue from `index.json`, props from the preview runtime. `source: auto` tries MCP, then static. | A1, A10 | ADR 0002, S1 | L |
 | 3.2 | *(With hosting)* **Auth for protected Storybooks**: headers or a cookie taken from an environment variable, never written to disk or JSON | A1 | S2 | M |
 | 3.3 | **Token categorization rules in config** (glob → category), plus reading `@theme` next to a Tailwind config. Built-in presets for PrimeVue/Aura. | A6 | 2.1 | M |
-| 3.4 | **String props with known values**: use `argTypes.options` and story args as enum values when the prop type is a plain string | A9 | 3.1 | M |
+| 3.4 | **Props with known values (A9, A11)**: resolve named union types (`ButtonSeverity`) to their members, from the framework's docgen output where it has them (e.g. vue-component-meta's schema) or from the component's source types; then use `argTypes.options` and story args as enum values for plain strings. The [Phase 1 rerun](../research/2026-10-07-vue-library-phase1-field-test.md) showed named unions are the main cause of missing variants. | A9, A11 | 2.6 | M |
 
 **Phase 3 acceptance (v1):** on the Vue library, radius, typography and shadow tokens reach the plan, and Button's `severity` and Badge's props appear as variants.
 **With hosting:** `npx storysync plan` works against `https://ui.platform.4flow-software.com/latest/` with a cookie from the environment, with no changes to the Vue library repo.
@@ -161,7 +162,7 @@ The north star. Scope: everything, up to full component code, as a pull request 
 |---|---|
 | 0 | Done except macOS check of S5 and the hosting spikes (S1, S2, S7) |
 | 1 | ✅ Done (uncommitted) |
-| 2 | Not started |
+| 2 | ✅ Done (uncommitted) |
 | 3 | Not started |
 | 4 | Not started |
 | 5 | Not started |

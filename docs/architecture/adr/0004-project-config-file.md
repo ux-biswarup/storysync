@@ -1,6 +1,7 @@
 # 0004. Add a project config file, `storysync.config.json`
 
-**Status:** Proposed
+**Status:** Accepted
+**Deciders:** Biswarup Mondal (approved by starting Phase 2, 2026-10-08)
 **Date:** 2026-10-07
 **Solves:** A5, A6
 
